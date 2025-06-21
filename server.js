@@ -38,16 +38,23 @@ function broadcastCandidates() {
     });
 }
 
-// Helper function to generate a random candidate
 function generateCandidate() {
-    return {
-        id: uuidv4(),
-        name: faker.person.fullName(),
-        party: faker.helpers.arrayElement(['PNL', 'AUR', 'USR', 'Independent', 'Green Party', 'PSD']),
-        description: faker.lorem.sentence({ min: 10, max: 20 }),
-        imageUrl: faker.helpers.arrayElement([ 'https://duckduckgo.com/i/255febbe579217e1.jpg', 'https://duckduckgo.com/i/15f51d6ee557e753.jpg', 'https://duckduckgo.com/i/05d55141240b08df.jpg', 'https://duckduckgo.com/i/830ff11fac94b260.jpg' ]),
-        createdAt: new Date().toISOString(),
-    };
+    try{
+        const gender = faker.helpers.arrayElement(['men', 'women']); // Randomly select gender
+        const imageId = faker.number.int({ min: 1, max: 99 }); // Randomly select image ID between 1 and 99
+
+        return {
+            id: uuidv4(),
+            name: faker.person.fullName(),
+            party: faker.helpers.arrayElement(['PNL', 'AUR', 'USR', 'Independent', 'Green Party', 'PSD']),
+            description: faker.lorem.sentence({ min: 10, max: 20 }),
+            imageUrl: `https://randomuser.me/api/portraits/${gender}/${imageId}.jpg`, // Generate URL dynamically
+        };
+
+    }catch (error) {
+        console.error('Error generating candidate:', error);
+        throw new Error('Failed to generate candidate');
+    }
 }
 
 // CRUD Routes
@@ -56,40 +63,60 @@ app.get('/api/candidates', (req, res) => {
 });
 
 app.post('/api/candidates', (req, res) => {
-    const candidate = { ...req.body, id: uuidv4(), createdAt: new Date().toISOString() };
-    candidates.push(candidate);
-    broadcastCandidates();
-    res.status(201).json(candidate);
+    try{
+        const candidate = { ...req.body, id: uuidv4()};
+        candidates.push(candidate);
+        broadcastCandidates();
+        res.status(201).json(candidate);
+    } catch (error) {
+        console.error('Error creating candidate:', error);
+        return res.status(500).json({ error: 'Failed to create candidate' });
+    }
 });
 
 app.put('/api/candidates/:id', (req, res) => {
-    const { id } = req.params;
-    const index = candidates.findIndex((c) => c.id === id);
-    if (index === -1) {
-        return res.status(404).json({ error: 'Candidate not found' });
+    try {
+        const { id } = req.params;
+        const index = candidates.findIndex((c) => c.id === id);
+        if (index === -1) {
+            return res.status(404).json({ error: 'Candidate not found' });
+        }
+        candidates[index] = { ...candidates[index], ...req.body };
+        broadcastCandidates();
+        res.json(candidates[index]);
+    } catch (error) {
+        console.error('Error updating candidate:', error);
+        return res.status(500).json({ error: 'Failed to update candidate' });
     }
-    candidates[index] = { ...candidates[index], ...req.body };
-    broadcastCandidates();
-    res.json(candidates[index]);
 });
 
 app.delete('/api/candidates/:id', (req, res) => {
-    const { id } = req.params;
-    const index = candidates.findIndex((c) => c.id === id);
-    if (index === -1) {
-        return res.status(404).json({ error: 'Candidate not found' });
+    try {
+        const { id } = req.params;
+        const index = candidates.findIndex((c) => c.id === id);
+        if (index === -1) {
+            return res.status(404).json({ error: 'Candidate not found' });
+        }
+        candidates.splice(index, 1);
+        broadcastCandidates();
+        res.status(204).send();
+    } catch (error) {
+        console.error('Error deleting candidate:', error);
+        return res.status(500).json({ error: 'Failed to delete candidate' });
     }
-    candidates.splice(index, 1);
-    broadcastCandidates();
-    res.status(204).send();
 });
 
 // Candidate generation endpoint
 app.post('/api/candidates/generate', (req, res) => {
-    const newCandidate = generateCandidate();
-    candidates.push(newCandidate);
-    broadcastCandidates();
-    res.status(201).json(newCandidate);
+    try {
+        const newCandidate = generateCandidate();
+        candidates.push(newCandidate);
+        broadcastCandidates();
+        res.status(201).json(newCandidate);
+    } catch (error) {
+        console.error('Error generating candidate:', error);
+        return res.status(500).json({ error: 'Failed to generate candidate' });
+    }
 });
 
 // Start server
