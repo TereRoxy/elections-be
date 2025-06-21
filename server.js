@@ -16,7 +16,7 @@ const server = http.createServer(app);
 const wss = new Server({ server });
 
 // PostgreSQL connection using Railway's DATABASE_URL
-const sequelize = new Sequelize(process.env.DATABASE_URL, {
+const sequelize = new Sequelize(process.env.DATABASE_PUBLIC_URL, {
     dialect: 'postgres',
     logging: false,
     dialectOptions: {
@@ -31,10 +31,6 @@ const User = sequelize.define('User', {
         allowNull: false,
         unique: true,
         validate: { is: /^\d{13}$/ }
-    },
-    password: {
-        type: DataTypes.STRING,
-        allowNull: false
     },
     hasVoted: {
         type: DataTypes.BOOLEAN,
@@ -158,7 +154,7 @@ async function generateCandidate() {
 // Authentication Routes
 app.post('/api/register', async (req, res) => {
     try {
-        const { cnp, password } = req.body;
+        const { cnp } = req.body;
         
         if (!/^\d{13}$/.test(cnp)) {
             return res.status(400).json({ error: 'Invalid CNP format' });
@@ -169,10 +165,8 @@ app.post('/api/register', async (req, res) => {
             return res.status(400).json({ error: 'User already exists' });
         }
         
-        const hashedPassword = await bcrypt.hash(password, 10);
         const user = await User.create({
             cnp,
-            password: hashedPassword
         });
         
         req.session.user = { cnp: user.cnp };
@@ -185,15 +179,10 @@ app.post('/api/register', async (req, res) => {
 
 app.post('/api/login', async (req, res) => {
     try {
-        const { cnp, password } = req.body;
+        const { cnp } = req.body;
         
         const user = await User.findOne({ where: { cnp } });
         if (!user) {
-            return res.status(401).json({ error: 'Invalid credentials' });
-        }
-        
-        const isValidPassword = await bcrypt.compare(password, user.password);
-        if (!isValidPassword) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
         
