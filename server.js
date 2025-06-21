@@ -80,7 +80,7 @@ const Candidate = sequelize.define('Candidate', {
 // Session configuration
 app.use(session({
     store: new pgSession({
-        pool: false, // Use Sequelize's connection
+        pool: sequelize.connectionManager.pool, // Use Sequelize's pool, // Use Sequelize's connection
         conString: process.env.DATABASE_URL,
         tableName: 'sessions',
         schemaName: 'public',
