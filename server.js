@@ -315,7 +315,7 @@ app.post('/api/candidates/generate', authenticateSession, async (req, res) => {
 });
 
 // Initialize database and start server
-sequelize.sync({ force: false }).then(() => {
+sequelize.sync({ force: true }).then(() => {
     const PORT = process.env.PORT || 3001;
     server.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);
