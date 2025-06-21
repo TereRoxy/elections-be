@@ -1,5 +1,5 @@
 const express = require('express');
-const { Server } = require('ws');
+const { Server, WebSocket } = require('ws');
 const http = require('http');
 const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
