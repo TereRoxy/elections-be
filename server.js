@@ -5,7 +5,9 @@ const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
 const { faker } = require('@faker-js/faker');
 const { Sequelize, DataTypes } = require('sequelize');
-const jwt = require('jsonwebtoken');
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
+const pgSession = require('connect-pg-simple')(session);
 
 faker.locale = 'ro_RO'; // For Romanian names
 
@@ -81,57 +83,50 @@ const Candidate = sequelize.define('Candidate', {
     timestamps: false
 });
 
-// JWT Secret
-const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
+// Session configuration
+app.use(session({
+    store: new pgSession({
+        conString: process.env.DATABASE_URL,
+        tableName: 'sessions',
+        schemaName: 'public',
+        createTableIfMissing: true
+    }),
+    secret: process.env.SESSION_SECRET || 'your_session_secret',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        secure: true,
+        maxAge: 24 * 60 * 60 * 1000, // 24 hours
+        sameSite: 'none', // Allow cross-origin cookies
+        httpOnly: true // Prevent client-side access to cookies
+    }
+}));
 
-// CORS configuration
 app.use(cors({
-    origin: 'https://your-frontend-app.railway.app', // Replace with your actual frontend domain
+    origin: true,
+    credentials: true
 }));
 app.use(express.json());
 
-// JWT Authentication Middleware
-const authenticateJWT = (req, res, next) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'No token provided' });
+// Authentication Middleware
+const authenticateSession = (req, res, next) => {
+    if (!req.session.user) {
+        return res.status(401).json({ error: 'Not authenticated' });
     }
-
-    const token = authHeader.split(' ')[1];
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        req.user = { cnp: decoded.cnp };
-        next();
-    } catch (error) {
-        console.error('JWT verification failed:', error);
-        res.status(401).json({ error: 'Invalid or expired token' });
-    }
+    next();
 };
 
-// WebSocket connection handling with JWT verification
+// WebSocket connection handling with session verification
 wss.on('connection', async (ws, req) => {
     console.log('Client connected');
     
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        ws.close(1008, 'Unauthorized');
-        return;
-    }
-
-    const token = authHeader.split(' ')[1];
-    try {
-        jwt.verify(token, JWT_SECRET);
-        // Send current candidates list to newly connected client
-        const candidates = await Candidate.findAll();
-        ws.send(JSON.stringify({ type: 'candidates', data: candidates }));
-        
-        ws.on('close', () => {
-            console.log('Client disconnected');
-        });
-    } catch (error) {
-        console.error('WebSocket JWT verification failed:', error);
-        ws.close(1008, 'Unauthorized');
-    }
+    // Send current candidates list to newly connected client
+    const candidates = await Candidate.findAll();
+    await ws.send(JSON.stringify({ type: 'candidates', data: candidates }));
+    
+    ws.on('close', () => {
+        console.log('Client disconnected');
+    });
 });
 
 // Broadcast candidates to all connected WebSocket clients
@@ -177,10 +172,12 @@ app.post('/api/register', async (req, res) => {
             return res.status(400).json({ error: 'User already exists' });
         }
         
-        const user = await User.create({ cnp });
+        const user = await User.create({
+            cnp,
+        });
         
-        const token = jwt.sign({ cnp: user.cnp }, JWT_SECRET, { expiresIn: '24h' });
-        res.status(201).json({ message: 'User registered successfully', token });
+        req.session.user = { cnp: user.cnp };
+        res.status(201).json({ message: 'User registered successfully' });
     } catch (error) {
         console.error('Error registering user:', error);
         res.status(500).json({ error: 'Failed to register user', message: error.message });
@@ -196,8 +193,8 @@ app.post('/api/login', async (req, res) => {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
         
-        const token = jwt.sign({ cnp: user.cnp }, JWT_SECRET, { expiresIn: '24h' });
-        res.json({ message: 'Login successful', token, hasVoted: user.hasVoted });
+        req.session.user = { cnp: user.cnp };
+        res.json({ message: 'Login successful', hasVoted: user.hasVoted });
     } catch (error) {
         console.error('Error logging in:', error);
         res.status(500).json({ error: 'Failed to login', message: error.message });
@@ -205,29 +202,33 @@ app.post('/api/login', async (req, res) => {
 });
 
 app.post('/api/logout', (req, res) => {
-    // JWT is stateless; client should discard the token
-    res.json({ message: 'Logout successful' });
+    req.session.destroy((err) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to logout' });
+        }
+        res.json({ message: 'Logout successful' });
+    });
 });
 
-app.get('/api/check-session', authenticateJWT, async (req, res) => {
-    try {
-        const user = await User.findOne({ where: { cnp: req.user.cnp } });
-        if (user) {
-            res.json({ isAuthenticated: true, hasVoted: user.hasVoted });
-        } else {
-            res.json({ isAuthenticated: false });
-        }
-    } catch (error) {
-        console.error('Error checking session:', error);
-        res.status(500).json({ error: 'Failed to check session', message: error.message });
+app.get('/api/check-session', (req, res) => {
+    if (req.session.user) {
+        User.findOne({ where: { cnp: req.session.user.cnp } }).then(user => {
+            if (user) {
+                res.json({ isAuthenticated: true, hasVoted: user.hasVoted });
+            } else {
+                res.json({ isAuthenticated: false });
+            }
+        });
+    } else {
+        res.json({ isAuthenticated: false });
     }
 });
 
 // Voting Route
-app.post('/api/vote/:candidateId', authenticateJWT, async (req, res) => {
+app.post('/api/vote/:candidateId', authenticateSession, async (req, res) => {
     try {
         const { candidateId } = req.params;
-        const user = await User.findOne({ where: { cnp: req.user.cnp } });
+        const user = await User.findOne({ where: { cnp: req.session.user.cnp } });
         
         if (user.hasVoted) {
             return res.status(400).json({ error: 'User has already voted' });
@@ -254,7 +255,7 @@ app.post('/api/vote/:candidateId', authenticateJWT, async (req, res) => {
 });
 
 // CRUD Routes (protected)
-app.get('/api/candidates', authenticateJWT, async (req, res) => {
+app.get('/api/candidates', authenticateSession, async (req, res) => {
     try {
         const candidates = await Candidate.findAll();
         res.json(candidates);
@@ -264,7 +265,7 @@ app.get('/api/candidates', authenticateJWT, async (req, res) => {
     }
 });
 
-app.post('/api/candidates', authenticateJWT, async (req, res) => {
+app.post('/api/candidates', authenticateSession, async (req, res) => {
     try {
         const candidate = await Candidate.create({ ...req.body, id: uuidv4(), voteCount: 0 });
         await broadcastCandidates();
@@ -275,7 +276,7 @@ app.post('/api/candidates', authenticateJWT, async (req, res) => {
     }
 });
 
-app.put('/api/candidates/:id', authenticateJWT, async (req, res) => {
+app.put('/api/candidates/:id', authenticateSession, async (req, res) => {
     try {
         const { id } = req.params;
         const candidate = await Candidate.findOne({ where: { id } });
@@ -291,7 +292,7 @@ app.put('/api/candidates/:id', authenticateJWT, async (req, res) => {
     }
 });
 
-app.delete('/api/candidates/:id', authenticateJWT, async (req, res) => {
+app.delete('/api/candidates/:id', authenticateSession, async (req, res) => {
     try {
         const { id } = req.params;
         const candidate = await Candidate.findOne({ where: { id } });
@@ -308,7 +309,7 @@ app.delete('/api/candidates/:id', authenticateJWT, async (req, res) => {
 });
 
 // Candidate generation endpoint
-app.post('/api/candidates/generate', authenticateJWT, async (req, res) => {
+app.post('/api/candidates/generate', authenticateSession, async (req, res) => {
     try {
         const newCandidate = await generateCandidate();
         const candidate = await Candidate.create(newCandidate);
@@ -322,7 +323,6 @@ app.post('/api/candidates/generate', authenticateJWT, async (req, res) => {
 
 // Initialize database and start server
 sequelize.sync({ force: true }).then(() => {
-    app.set('trust proxy', 1); // Trust Railway's proxy
     const PORT = process.env.PORT || 3001;
     server.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);
