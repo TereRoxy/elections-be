@@ -24,6 +24,12 @@ const sequelize = new Sequelize(process.env.DATABASE_PUBLIC_URL, {
     }
 });
 
+sequelize.authenticate().then(() => {
+    console.log('Database connection successful');
+}).catch(err => {
+    console.error('Database connection failed:', err);
+});
+
 // User Model
 const User = sequelize.define('User', {
     cnp: {
@@ -80,7 +86,6 @@ const Candidate = sequelize.define('Candidate', {
 // Session configuration
 app.use(session({
     store: new pgSession({
-        pool: sequelize.connectionManager.pool, // Use Sequelize's pool, // Use Sequelize's connection
         conString: process.env.DATABASE_URL,
         tableName: 'sessions',
         schemaName: 'public',
