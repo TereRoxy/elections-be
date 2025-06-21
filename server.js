@@ -4,6 +4,10 @@ const http = require('http');
 const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
 const { faker } = require('@faker-js/faker');
+const { Sequelize, DataTypes } = require('sequelize');
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
+const pgSession = require('connect-pg-simple')(session);
 
 faker.locale = 'ro_RO'; // For Romanian names
 
@@ -11,19 +15,112 @@ const app = express();
 const server = http.createServer(app);
 const wss = new Server({ server });
 
-// In-memory storage for candidates
-let candidates = [];
+// PostgreSQL connection using Railway's DATABASE_URL
+const sequelize = new Sequelize(process.env.DATABASE_URL, {
+    dialect: 'postgres',
+    logging: false,
+    dialectOptions: {
+        ssl: process.env.NODE_ENV === 'production' ? { require: true, rejectUnauthorized: false } : false
+    }
+});
 
-app.use(cors());
+// User Model
+const User = sequelize.define('User', {
+    cnp: {
+        type: DataTypes.STRING(13),
+        allowNull: false,
+        unique: true,
+        validate: { is: /^\d{13}$/ }
+    },
+    password: {
+        type: DataTypes.STRING,
+        allowNull: false
+    },
+    hasVoted: {
+        type: DataTypes.BOOLEAN,
+        defaultValue: false
+    },
+    votedCandidateId: {
+        type: DataTypes.STRING,
+        allowNull: true
+    }
+}, {
+    tableName: 'users',
+    timestamps: false
+});
+
+// Candidate Model
+const Candidate = sequelize.define('Candidate', {
+    id: {
+        type: DataTypes.STRING,
+        primaryKey: true,
+        allowNull: false
+    },
+    name: {
+        type: DataTypes.STRING,
+        allowNull: false
+    },
+    party: {
+        type: DataTypes.STRING,
+        allowNull: false
+    },
+    description: {
+        type: DataTypes.TEXT,
+        allowNull: false
+    },
+    imageUrl: {
+        type: DataTypes.STRING,
+        allowNull: false
+    },
+    voteCount: {
+        type: DataTypes.INTEGER,
+        defaultValue: 0
+    }
+}, {
+    tableName: 'candidates',
+    timestamps: false
+});
+
+// Session configuration
+app.use(session({
+    store: new pgSession({
+        pool: false, // Use Sequelize's connection
+        conString: process.env.DATABASE_URL,
+        tableName: 'sessions',
+        schemaName: 'public',
+        createTableIfMissing: true
+    }),
+    secret: process.env.SESSION_SECRET || 'your_session_secret',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    }
+}));
+
+app.use(cors({
+    origin: true,
+    credentials: true
+}));
 app.use(express.json());
 
-// WebSocket connection handling
-wss.on('connection', async (ws) => {
+// Authentication Middleware
+const authenticateSession = (req, res, next) => {
+    if (!req.session.user) {
+        return res.status(401).json({ error: 'Not authenticated' });
+    }
+    next();
+};
+
+// WebSocket connection handling with session verification
+wss.on('connection', async (ws, req) => {
     console.log('Client connected');
     
     // Send current candidates list to newly connected client
+    const candidates = await Candidate.findAll();
     await ws.send(JSON.stringify({ type: 'candidates', data: candidates }));
-
+    
     ws.on('close', () => {
         console.log('Client disconnected');
     });
@@ -31,6 +128,7 @@ wss.on('connection', async (ws) => {
 
 // Broadcast candidates to all connected WebSocket clients
 async function broadcastCandidates() {
+    const candidates = await Candidate.findAll();
     for (const client of wss.clients) {
         if (client.readyState === WebSocket.OPEN) {
             await client.send(JSON.stringify({ type: 'candidates', data: candidates }));
@@ -40,98 +138,199 @@ async function broadcastCandidates() {
 
 async function generateCandidate() {
     try {
-        const gender = await faker.helpers.arrayElement(['men', 'women']); // Randomly select gender
-        const imageId = await faker.number.int({ min: 1, max: 99 }); // Randomly select image ID between 1 and 99
+        const gender = await faker.helpers.arrayElement(['men', 'women']);
+        const imageId = await faker.number.int({ min: 1, max: 99 });
 
         return {
             id: uuidv4(),
             name: await faker.person.fullName(),
             party: await faker.helpers.arrayElement(['PNL', 'AUR', 'USR', 'Independent', 'Green Party', 'PSD']),
             description: await faker.lorem.sentence({ min: 10, max: 20 }),
-            imageUrl: `https://randomuser.me/api/portraits/${gender}/${imageId}.jpg`, // Generate URL dynamically
+            imageUrl: `https://randomuser.me/api/portraits/${gender}/${imageId}.jpg`,
+            voteCount: 0
         };
     } catch (error) {
         console.error('Error generating candidate:', error);
-        throw new Error('Failed to generate candidate in generateCandidate function');
+        throw new Error('Failed to generate candidate');
     }
 }
 
-// CRUD Routes
-app.get('/api/candidates', async (req, res) => {
-    res.json(candidates);
+// Authentication Routes
+app.post('/api/register', async (req, res) => {
+    try {
+        const { cnp, password } = req.body;
+        
+        if (!/^\d{13}$/.test(cnp)) {
+            return res.status(400).json({ error: 'Invalid CNP format' });
+        }
+        
+        const existingUser = await User.findOne({ where: { cnp } });
+        if (existingUser) {
+            return res.status(400).json({ error: 'User already exists' });
+        }
+        
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const user = await User.create({
+            cnp,
+            password: hashedPassword
+        });
+        
+        req.session.user = { cnp: user.cnp };
+        res.status(201).json({ message: 'User registered successfully' });
+    } catch (error) {
+        console.error('Error registering user:', error);
+        res.status(500).json({ error: 'Failed to register user', message: error.message });
+    }
 });
 
-app.post('/api/candidates', async (req, res) => {
+app.post('/api/login', async (req, res) => {
     try {
-        const candidate = { ...req.body, id: uuidv4() };
-        candidates.push(candidate);
+        const { cnp, password } = req.body;
+        
+        const user = await User.findOne({ where: { cnp } });
+        if (!user) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        const isValidPassword = await bcrypt.compare(password, user.password);
+        if (!isValidPassword) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        req.session.user = { cnp: user.cnp };
+        res.json({ message: 'Login successful', hasVoted: user.hasVoted });
+    } catch (error) {
+        console.error('Error logging in:', error);
+        res.status(500).json({ error: 'Failed to login', message: error.message });
+    }
+});
+
+app.post('/api/logout', (req, res) => {
+    req.session.destroy((err) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to logout' });
+        }
+        res.json({ message: 'Logout successful' });
+    });
+});
+
+app.get('/api/check-session', (req, res) => {
+    if (req.session.user) {
+        User.findOne({ where: { cnp: req.session.user.cnp } }).then(user => {
+            if (user) {
+                res.json({ isAuthenticated: true, hasVoted: user.hasVoted });
+            } else {
+                res.json({ isAuthenticated: false });
+            }
+        });
+    } else {
+        res.json({ isAuthenticated: false });
+    }
+});
+
+// Voting Route
+app.post('/api/vote/:candidateId', authenticateSession, async (req, res) => {
+    try {
+        const { candidateId } = req.params;
+        const user = await User.findOne({ where: { cnp: req.session.user.cnp } });
+        
+        if (user.hasVoted) {
+            return res.status(400).json({ error: 'User has already voted' });
+        }
+        
+        const candidate = await Candidate.findOne({ where: { id: candidateId } });
+        if (!candidate) {
+            return res.status(404).json({ error: 'Candidate not found' });
+        }
+        
+        user.hasVoted = true;
+        user.votedCandidateId = candidateId;
+        candidate.voteCount += 1;
+        
+        await user.save();
+        await candidate.save();
+        await broadcastCandidates();
+        
+        res.json({ message: 'Vote recorded successfully' });
+    } catch (error) {
+        console.error('Error voting:', error);
+        res.status(500).json({ error: 'Failed to record vote', message: error.message });
+    }
+});
+
+// CRUD Routes (protected)
+app.get('/api/candidates', authenticateSession, async (req, res) => {
+    try {
+        const candidates = await Candidate.findAll();
+        res.json(candidates);
+    } catch (error) {
+        console.error('Error fetching candidates:', error);
+        res.status(500).json({ error: 'Failed to fetch candidates', message: error.message });
+    }
+});
+
+app.post('/api/candidates', authenticateSession, async (req, res) => {
+    try {
+        const candidate = await Candidate.create({ ...req.body, id: uuidv4(), voteCount: 0 });
         await broadcastCandidates();
         res.status(201).json(candidate);
     } catch (error) {
         console.error('Error creating candidate:', error);
-        return res.status(500).json({ 
-            error: 'Failed to create candidate', 
-            message: error.message // Include the error message in the response
-        });
+        res.status(500).json({ error: 'Failed to create candidate', message: error.message });
     }
 });
 
-app.put('/api/candidates/:id', async (req, res) => {
+app.put('/api/candidates/:id', authenticateSession, async (req, res) => {
     try {
         const { id } = req.params;
-        const index = candidates.findIndex((c) => c.id === id);
-        if (index === -1) {
+        const candidate = await Candidate.findOne({ where: { id } });
+        if (!candidate) {
             return res.status(404).json({ error: 'Candidate not found' });
         }
-        candidates[index] = { ...candidates[index], ...req.body };
+        await candidate.update(req.body);
         await broadcastCandidates();
-        res.json(candidates[index]);
+        res.json(candidate);
     } catch (error) {
         console.error('Error updating candidate:', error);
-        return res.status(500).json({ 
-            error: 'Failed to update candidate', 
-            message: error.message // Include the error message in the response
-        });
+        res.status(500).json({ error: 'Failed to update candidate', message: error.message });
     }
 });
 
-app.delete('/api/candidates/:id', async (req, res) => {
+app.delete('/api/candidates/:id', authenticateSession, async (req, res) => {
     try {
         const { id } = req.params;
-        const index = candidates.findIndex((c) => c.id === id);
-        if (index === -1) {
+        const candidate = await Candidate.findOne({ where: { id } });
+        if (!candidate) {
             return res.status(404).json({ error: 'Candidate not found' });
         }
-        candidates.splice(index, 1);
+        await candidate.destroy();
         await broadcastCandidates();
         res.status(204).send();
     } catch (error) {
         console.error('Error deleting candidate:', error);
-        return res.status(500).json({ 
-            error: 'Failed to delete candidate', 
-            message: error.message // Include the error message in the response
-        });
+        res.status(500).json({ error: 'Failed to delete candidate', message: error.message });
     }
 });
 
 // Candidate generation endpoint
-app.post('/api/candidates/generate', async (req, res) => {
+app.post('/api/candidates/generate', authenticateSession, async (req, res) => {
     try {
         const newCandidate = await generateCandidate();
-        candidates.push(newCandidate);
+        const candidate = await Candidate.create(newCandidate);
         await broadcastCandidates();
-        res.status(201).json(newCandidate);
+        res.status(201).json(candidate);
     } catch (error) {
         console.error('Error generating candidate:', error);
-        return res.status(500).json({ 
-            error: 'Failed to generate candidate', 
-            message: error.message // Include the error message in the response
-        });
+        res.status(500).json({ error: 'Failed to generate candidate', message: error.message });
     }
 });
 
-// Start server
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+// Initialize database and start server
+sequelize.sync({ force: false }).then(() => {
+    const PORT = process.env.PORT || 3001;
+    server.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+    });
+}).catch(error => {
+    console.error('Failed to sync database:', error);
 });
