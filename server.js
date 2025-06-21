@@ -101,10 +101,12 @@ const sessionMiddleware = session({
 
 // Apply session middleware
 app.use(sessionMiddleware);
-
+// Add this before your other routes
+app.options('*', cors());
 app.use(cors({
     origin: true,
-    credentials: false // No cookies, so credentials are not needed
+    credentials: false, // No cookies, so credentials are not needed
+    allowedHeaders: ['Content-Type', 'X-Session-ID'], // Allow necessary headers
 }));
 app.use(express.json());
 
