@@ -1,12 +1,11 @@
 const express = require('express');
-const { Server, WebSocket } = require('ws');
+const { Server, WebSocket } = require('websocket');
 const http = require('http');
 const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
 const { faker } = require('@faker-js/faker');
 const { Sequelize, DataTypes } = require('sequelize');
 const session = require('express-session');
-const bcrypt = require('bcryptjs');
 const pgSession = require('connect-pg-simple')(session);
 
 faker.locale = 'ro_RO'; // For Romanian names
@@ -83,48 +82,73 @@ const Candidate = sequelize.define('Candidate', {
     timestamps: false
 });
 
-// Session configuration
-app.use(session({
-    store: new pgSession({
-        conString: process.env.DATABASE_URL,
-        tableName: 'sessions',
-        schemaName: 'public',
-        createTableIfMissing: true
-    }),
+// Session store
+const sessionStore = new pgSession({
+    conString: process.env.DATABASE_URL,
+    tableName: 'sessions',
+    schemaName: 'public',
+    createTableIfMissing: true
+});
+
+// Session configuration without cookies
+const sessionMiddleware = session({
+    store: sessionStore,
     secret: process.env.SESSION_SECRET || 'your_session_secret',
     resave: false,
     saveUninitialized: false,
-    cookie: {
-        secure: true,
-        maxAge: 24 * 60 * 60 * 1000, // 24 hours
-        sameSite: 'none', // Allow cross-origin cookies
-        httpOnly: true // Prevent client-side access to cookies
-    }
-}));
+    cookie: { maxAge: null } // No cookies will be sent to client
+});
+
+// Apply session middleware
+app.use(sessionMiddleware);
 
 app.use(cors({
     origin: true,
-    credentials: true
+    credentials: false // No cookies, so credentials are not needed
 }));
 app.use(express.json());
 
 // Authentication Middleware
 const authenticateSession = (req, res, next) => {
-    // Simulate authentication by allowing all requests to proceed
-    req.session.user = { cnp: '1234567890123' }; // Simulated user session
-    next();
+    const sessionId = req.get('X-Session-ID');
+    if (!sessionId) {
+        return res.status(401).json({ error: 'Session ID required' });
+    }
+
+    // Retrieve session from store
+    sessionStore.get(sessionId, (err, session) => {
+        if (err || !session || !session.user) {
+            return res.status(401).json({ error: 'Invalid or expired session' });
+        }
+        req.session = session; // Attach session to request
+        req.session.user = session.user; // Ensure user data is available
+        next();
+    });
 };
 
 // WebSocket connection handling with session verification
 wss.on('connection', async (ws, req) => {
-    console.log('Client connected');
-    
-    // Send current candidates list to newly connected client
-    const candidates = await Candidate.findAll();
-    await ws.send(JSON.stringify({ type: 'candidates', data: candidates }));
-    
-    ws.on('close', () => {
-        console.log('Client disconnected');
+    const sessionId = req.headers['x-session-id'];
+    if (!sessionId) {
+        ws.close(1008, 'Session ID required');
+        return;
+    }
+
+    sessionStore.get(sessionId, async (err, session) => {
+        if (err || !session || !session.user) {
+            ws.close(1008, 'Invalid or expired session');
+            return;
+        }
+
+        console.log('WebSocket client connected with session:', sessionId);
+        
+        // Send current candidates list to newly connected client
+        const candidates = await Candidate.findAll();
+        ws.send(JSON.stringify({ type: 'candidates', data: candidates }));
+        
+        ws.on('close', () => {
+            console.log('WebSocket client disconnected');
+        });
     });
 });
 
@@ -133,7 +157,7 @@ async function broadcastCandidates() {
     const candidates = await Candidate.findAll();
     for (const client of wss.clients) {
         if (client.readyState === WebSocket.OPEN) {
-            await client.send(JSON.stringify({ type: 'candidates', data: candidates }));
+            client.send(JSON.stringify({ type: 'candidates', data: candidates }));
         }
     }
 }
@@ -171,12 +195,19 @@ app.post('/api/register', async (req, res) => {
             return res.status(400).json({ error: 'User already exists' });
         }
         
-        const user = await User.create({
-            cnp,
-        });
+        const user = await User.create({ cnp });
         
+        // Initialize session
         req.session.user = { cnp: user.cnp };
-        res.status(201).json({ message: 'User registered successfully' });
+        const sessionId = req.sessionID;
+        
+        // Save session manually
+        sessionStore.set(sessionId, req.session, (err) => {
+            if (err) {
+                return res.status(500).json({ error: 'Failed to save session' });
+            }
+            res.status(201).json({ message: 'User registered successfully', sessionId });
+        });
     } catch (error) {
         console.error('Error registering user:', error);
         res.status(500).json({ error: 'Failed to register user', message: error.message });
@@ -192,8 +223,17 @@ app.post('/api/login', async (req, res) => {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
         
+        // Initialize session
         req.session.user = { cnp: user.cnp };
-        res.json({ message: 'Login successful', hasVoted: user.hasVoted });
+        const sessionId = req.sessionID;
+        
+        // Save session manually
+        sessionStore.set(sessionId, req.session, (err) => {
+            if (err) {
+                return res.status(500).json({ error: 'Failed to save session' });
+            }
+            res.json({ message: 'Login successful', hasVoted: user.hasVoted, sessionId });
+        });
     } catch (error) {
         console.error('Error logging in:', error);
         res.status(500).json({ error: 'Failed to login', message: error.message });
@@ -201,7 +241,12 @@ app.post('/api/login', async (req, res) => {
 });
 
 app.post('/api/logout', (req, res) => {
-    req.session.destroy((err) => {
+    const sessionId = req.get('X-Session-ID');
+    if (!sessionId) {
+        return res.status(400).json({ error: 'Session ID required' });
+    }
+    
+    sessionStore.destroy(sessionId, (err) => {
         if (err) {
             return res.status(500).json({ error: 'Failed to logout' });
         }
@@ -210,17 +255,23 @@ app.post('/api/logout', (req, res) => {
 });
 
 app.get('/api/check-session', (req, res) => {
-    if (req.session.user) {
-        User.findOne({ where: { cnp: req.session.user.cnp } }).then(user => {
+    const sessionId = req.get('X-Session-ID');
+    if (!sessionId) {
+        return res.json({ isAuthenticated: false });
+    }
+    
+    sessionStore.get(sessionId, (err, session) => {
+        if (err || !session || !session.user) {
+            return res.json({ isAuthenticated: false });
+        }
+        User.findOne({ where: { cnp: session.user.cnp } }).then(user => {
             if (user) {
                 res.json({ isAuthenticated: true, hasVoted: user.hasVoted });
             } else {
                 res.json({ isAuthenticated: false });
             }
         });
-    } else {
-        res.json({ isAuthenticated: false });
-    }
+    });
 });
 
 // Voting Route
